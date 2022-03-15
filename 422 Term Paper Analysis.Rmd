@@ -1,0 +1,661 @@
+---
+title: "Term Paper Code "
+author: "Austin Jia"
+date: "4/24/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+###Packages
+
+```{r}
+# install.packages("haven")
+# install.packages("plm")
+
+require(haven)
+library(magrittr)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(VIM)
+library(mice)
+library(MASS)
+library(lme4)
+library(Matrix)
+require(GGally)
+require(reshape2)
+require(compiler)
+require(parallel)
+require(boot)
+require(lattice)
+library(plm)
+library(survival)
+```
+
+###Data Manipulation
+
+```{r}
+#Reading
+education = data.frame(read_sas("educ_12.sas7bdat"))
+nutrition = data.frame(read_sas("nutr3_00.sas7bdat"))
+id = data.frame(read_sas("surveys_pub_12.sas7bdat"))
+diet = data.frame(read_sas("c12diet.sas7bdat"))
+income = data.frame(read_sas("indinc_10.sas7bdat"))
+hhincome = data.frame(read_sas("hhinc_10.sas7bdat"))
+
+#Standardizing measurement in nutrition (consumption in 1989-2000 is measured in 50 grams)
+nutrition$V39[nutrition$WAVE==1989] = nutrition$V39[nutrition$WAVE==1989] * 50
+nutrition$V39[nutrition$WAVE==1991] = nutrition$V39[nutrition$WAVE==1991] * 50
+nutrition$V39[nutrition$WAVE==1993] = nutrition$V39[nutrition$WAVE==1993] * 50
+nutrition$V39[nutrition$WAVE==1997] = nutrition$V39[nutrition$WAVE==1997] * 50
+nutrition$V39[nutrition$WAVE==2000] = nutrition$V39[nutrition$WAVE==2000] * 50
+
+#Fixing Column Names
+#Education
+colnames(education)[1] = "ID_individual"
+colnames(education)[2] = "wave"
+colnames(education)[3] = "completion"
+colnames(education)[4] = "attainment"
+colnames(education)[5] = "enrollment"
+colnames(education)[10] = "ID_household"
+colnames(education)[13] = "province"
+
+#Nutrition
+colnames(nutrition)[1] = "ID_individual"
+colnames(nutrition)[5] = "grams"
+colnames(nutrition)[16] = "wave"
+colnames(nutrition)[19] = "ID_household"
+colnames(nutrition)[22] = "province"
+
+#id
+colnames(id)[1] = "ID_individual"
+colnames(id)[2] = "ID_household"
+colnames(id)[7] = "province"
+
+#Diet
+colnames(diet)[1] = "ID_individual"
+colnames(diet)[2] = "wave"
+colnames(diet)[3] = "ID_household"
+colnames(diet)[9] = "province"
+
+#Income
+colnames(income)[1] = "ID_household"
+colnames(income)[2] = "ID_individual"
+colnames(income)[3] = "wave"
+colnames(income)[27] = "income.adjusted"
+
+#HHincome
+colnames(hhincome)[1] = "wave"
+colnames(hhincome)[2] = "ID_household"
+colnames(hhincome)[26] = "province"
+colnames(hhincome)[36] = "hhincome.adjusted"
+
+#Fixing Unique IDs
+nutrition$ID_individual = format(nutrition$ID_individual, scientific=F)
+education$ID_individual = format(education$ID_individual, scientific=F)
+id$ID_individual = format(id$ID_individual, scientific=F)
+diet$ID_individual = format(diet$ID_individual, scientific=F)
+
+#Aggregating Nutrition observations
+nutrition1 = ddply(nutrition,.(wave,ID_individual,ID_household),summarize,grams=sum(grams)/3,meal_frequency=length(ID_individual))
+
+#Bind by individual id
+df.1 <- merge(nutrition1, education, by=c("ID_individual", "wave", "ID_household"))
+df.2 <- merge(df.1, id, by=c("ID_individual", "wave", "ID_household"))
+df.3 <- merge(df.2, diet, by=c("ID_individual", "wave", "ID_household"))
+df.all <- merge(df.3, hhincome, by=c("ID_household", "wave"))
+
+#Renaming variables with individual income
+# colnames(df.all)
+# colnames(df.all)[3] = "ID_household.dupl.0"
+# colnames(df.all)[13] = "ID_household.dupl.1"
+# colnames(df.all)[16] = "province.dupl.1"
+# colnames(df.all)[21] = "ID_household.dupl.2"
+# colnames(df.all)[25] = "province.dupl.2"
+# colnames(df.all)[38] = "ID_household.dupl.3"
+
+#Renaming variables with hh income
+colnames(df.all)
+colnames(df.all)[15] = "province"
+colnames(df.all)[23] = "province.dupl.1"
+colnames(df.all)[41] = "province.dupl.2"
+colnames(df.all)[70] = "province.dupl.3"
+
+df.all.compact = dplyr::select(df.all, ID_individual, ID_household, wave, grams, completion, attainment, enrollment, age, province, d3kcal, hhincome.adjusted, hhsize)
+
+#Handling categorical data 
+df.all.compact$enrollment = as.factor(df.all.compact$enrollment)
+df.all.compact$grams[df.all.compact$grams==0] <- NA
+df.all.compact$enrollment[df.all.compact$enrollment==9] <- NA
+df.all.compact$province = as.factor(df.all.compact$province)
+df.all.compact$wave = as.factor(df.all.compact$wave)
+df.all.compact$ID_individual = as.character(df.all.compact$ID_individual)
+df.all.compact$ID_household = as.character(df.all.compact$ID_household)
+
+#Handling d3 variable
+df.all.compact$d3kcal = df.all.compact$d3kcal/3
+```
+
+### Missing Data Imputation
+
+```{r, include = FALSE}
+sum(is.na(df.all.compact)) / (dim(df.all.compact)[1] * dim(df.all.compact)[2]) #percent missing data
+nrow(df.all.compact[complete.cases(df.all.compact), ])/nrow(df.all.compact) #complete case rate
+nrow(df.all.compact) - nrow(df.all.compact[complete.cases(df.all.compact), ])
+nrow(df.all.compact)
+```
+
+```{r, include=FALSE}
+missing.prop <- apply(df.all.compact, MARGIN = 2, FUN = function(x) { sum(is.na(x)) })
+missing.prop <- missing.prop / dim(df.all.compact)[1]
+missing.prop <- data.frame("prop" = missing.prop,
+                           "var" = names(df.all.compact))
+ggplot(missing.prop, aes(x = reorder(var, -prop), y = prop)) + 
+  geom_bar(stat = "identity") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) + 
+  geom_col(colour = "black", fill = "#FF6666") + 
+  xlab("Covariate") + 
+  ylab("Proportion Missing") +
+  ggtitle("The Proportion of Missing Values for Each Covariate")
+```
+
+```{r, include=FALSE}
+#Not MCAR
+marginplot(df.all.compact[, c("completion", "attainment")], col = mdc(1:2), cex.numbers = 1.2, pch = 19)
+```
+
+```{r, include=FALSE}
+#Mice
+init = mice(df.all.compact, maxit=0) 
+meth = init$method
+predM = init$predictorMatrix
+df_mice <- mice(df.all.compact, m=5, method="cart", predictorMatrix=predM, maxit = 5, seed = 500)
+
+df <- complete(df_mice)
+```
+
+### Time Series EDA
+
+```{r}
+p_enrollment = ggplot(subset(df, age <= 12 & age >= 5), aes(enrollment, fill=enrollment)) + geom_bar(width=.5) + facet_grid(~wave, scales="free_x", space="free") + ggtitle("Enrollment Trends") + xlab("Enrollment") + labs(fill = "Enrollment") 
+p_enrollment
+
+p_attainment = ggplot(df, aes(x = attainment)) + 
+  geom_bar(colour = "darkblue", fill = "lightblue") + 
+  facet_grid(~wave, scales="free_x", space="free") +
+  ggtitle("Attainment Trends") + 
+  xlab("Highest Grade Level Attained") +
+  theme(text = element_text(size=15),
+        axis.text.x = element_text(angle=0, hjust=1)) 
+p_attainment
+
+p_completion = ggplot(df, aes(x = completion)) + 
+  geom_bar(colour = "darkblue", fill = "lightblue") + 
+  facet_grid(~wave, scales="free_x", space="free") +
+  ggtitle("Completion Trends") + 
+  xlab("Number of Years Completed") +
+  theme(text = element_text(size=15),
+        axis.text.x = element_text(angle=90, hjust=1)) 
+p_completion
+
+
+p_grams = ggplot(df, aes(x = grams)) + 
+  geom_bar(colour = "darkblue", fill = "lightblue") + 
+  facet_grid(~wave, scales="free_x", space="free") +
+  ggtitle("Consumption Trends") + 
+  xlab("Grams Consumed over 3-Day Period") +
+  theme(text = element_text(size=15),
+        axis.text.x = element_text(angle=90, hjust=1)) 
+p_grams
+```
+
+### Consumption Regression
+
+```{r}
+#log scaling
+df$log_grams = log(df$grams)
+
+#household to per capita
+df$percapita = df$hhincome.adjusted/df$hhsize
+df$log_income = df$percapita
+df$log_income[df$log_income < 0.01] <- 1
+df$log_income = log(df$log_income)
+
+df$ID_individual = as.factor(df$ID_individual)
+df$ID_household = as.factor(df$ID_household)
+
+df$enrollment = as.numeric(df$enrollment)
+df$enrollment[df$enrollment==1] <- 0
+df$enrollment[df$enrollment==2] <- 1
+
+#Completion transformation
+df$completion[df$completion == 11] <- 1
+df$completion[df$completion == 12] <- 2
+df$completion[df$completion == 13] <- 3
+df$completion[df$completion == 14] <- 4
+df$completion[df$completion == 15] <- 5
+df$completion[df$completion == 16] <- 6
+df$completion[df$completion == 21] <- 7
+df$completion[df$completion == 22] <- 8
+df$completion[df$completion == 23] <- 9
+df$completion[df$completion == 24] <- 10
+df$completion[df$completion == 25] <- 11
+df$completion[df$completion == 26] <- 12
+df$completion[df$completion == 27] <- 13
+df$completion[df$completion == 28] <- 14
+df$completion[df$completion == 29] <- 15
+df$completion[df$completion == 31] <- 16
+df$completion[df$completion == 32] <- 17
+df$completion[df$completion == 33] <- 18
+df$completion[df$completion == 34] <- 19
+df$completion[df$completion == 35] <- 20
+df$completion[df$completion == 36] <- 21
+
+
+#Fixed effects (enrollment)
+fixed.enrollment <- plm(enrollment ~ log_grams + age + log_income, 
+                    data = subset(df, age <= 21 & age >= 5), start = NULL,
+                    index = c("ID_individual", "wave", "province"), 
+                    model = "within")
+summary(fixed.enrollment)
+
+
+
+#Fixed effects(attainment)
+fixed.attainment<- plm(attainment ~ log_grams + age + log_income, 
+                    data = subset(df, age <= 21 & age >= 5), start = NULL,
+                    index = c("ID_individual", "wave", "province"), 
+                    model = "within")
+summary(fixed.attainment)
+
+#Fixed effects (Completion)
+fixed.completion <- plm(completion ~ log_grams + age + log_income, 
+                    data = subset(df, age <= 21 & age >= 5), start = NULL,
+                    index = c("ID_individual", "wave", "province"), 
+                    model = "within")
+summary(fixed.completion)
+```
+
+### Energy Regression
+
+```{r}
+#log scaling
+colnames(df)[10] = "kcal"
+df$log_kcal = log(df$kcal)
+
+#Fixed effects (enrollment)
+fixed.enrollment.kcal <- plm(enrollment ~ log_kcal + age + log_income, 
+                    data = subset(df, age <= 21 & age >= 5), start = NULL,
+                    index = c("ID_individual", "wave", "province"), 
+                    model = "within")
+summary(fixed.enrollment.kcal)
+
+#Fixed effects(attainment)
+fixed.attainment.kcal<- plm(attainment ~ log_kcal + age + log_income, 
+                    data = subset(df, age <= 21 & age >= 5), start = NULL,
+                    index = c("ID_individual", "wave", "province"), 
+                    model = "within")
+summary(fixed.attainment.kcal)
+
+#Fixed effects (Completion)
+fixed.completion.kcal <- plm(completion ~ log_kcal + age + log_income, 
+                    data = subset(df, age <= 21 & age >= 5), start = NULL,
+                    index = c("ID_individual", "wave", "province"), 
+                    model = "within")
+summary(fixed.completion.kcal)
+```
+
+### Marginal effects plot
+
+#### Enrollment
+```{r}
+gdpPercap.sweep <- log(seq(100, 5000, 1e2)) # A parameter sweep of per-capita GDP change
+
+# Get the columns in the same order
+new.X <- model.frame(fixed.enrollment)
+new.X <- new.X[,names(coef(fixed.enrollment))]
+
+# Get a short representation of design matrix
+test.X <- colMeans(new.X)
+test.X[1:length(test.X)] <- 0 # Mean value for subject-centered data is always zero)
+
+# Fill out an empty test matrix
+test.X <- matrix(rep(test.X, each = length(gdpPercap.sweep)), nrow = length(gdpPercap.sweep))
+
+# Insert the parameter sweep
+test.X[,which(colnames(new.X) == 'log_grams')] <- gdpPercap.sweep
+
+level <- 0.95 # For a 95% confidence interval
+
+# Get the covariance matrix of the predictions
+vcov.prediction <- test.X %*% vcov(fixed.enrollment) %*% t(test.X)
+
+# The standard error of the prediction is then on the diagonal
+se.prediction <- sqrt(diag(vcov.prediction))
+
+# Get the predicted value by multiplying the design matrix
+#   against our coefficient estimates
+predicted <- (test.X %*% coef(fixed.enrollment))
+
+# Calculate the t-statistic corresponding to a 95% confidence level and
+#   the appropriate num. of degrees of freedom
+t.stat <- qt(1 - (1 - 0.95)/2, fixed.enrollment$df.residual)
+
+# Calculate the lower and upper bounds of the confidence interval
+lower.bound <- as.numeric(predicted - t.stat * se.prediction)
+upper.bound <- as.numeric(predicted + t.stat * se.prediction)
+
+head(cbind(lower.bound, predicted, upper.bound))
+
+library(scales)
+
+grams_marginal_enrollment <- data.frame(gdpPercap = gdpPercap.sweep,
+  prediction = predicted,
+  lower = lower.bound,
+  upper = upper.bound)
+
+ggplot(grams_marginal_enrollment, mapping = aes(x = exp(1)^gdpPercap, y = prediction)) +
+  geom_line() +
+  geom_ribbon(mapping = aes(ymin = lower, ymax = upper), alpha = 0.4) +
+  scale_x_continuous() +
+  labs(x = 'Increase in Consumption (Grams)', y = 'Predicted Change in Probability of Enrollment') +
+  theme_minimal() +
+  ggtitle("Consumption on Enrollment Marginal Effects Plot")
+
+coef(fixed.enrollment)
+```
+
+#### Attainment
+
+```{r}
+gdpPercap.sweep <- log(seq(100, 5000, 1e2)) # A parameter sweep of per-capita GDP change
+
+# Get the columns in the same order
+new.X <- model.frame(fixed.attainment)
+new.X <- new.X[,names(coef(fixed.attainment))]
+
+# Get a short representation of design matrix
+test.X <- colMeans(new.X)
+test.X[1:length(test.X)] <- 0 # Mean value for subject-centered data is always zero)
+
+# Fill out an empty test matrix
+test.X <- matrix(rep(test.X, each = length(gdpPercap.sweep)), nrow = length(gdpPercap.sweep))
+
+# Insert the parameter sweep
+test.X[,which(colnames(new.X) == 'log_grams')] <- gdpPercap.sweep
+
+level <- 0.95 # For a 95% confidence interval
+
+# Get the covariance matrix of the predictions
+vcov.prediction <- test.X %*% vcov(fixed.attainment) %*% t(test.X)
+
+# The standard error of the prediction is then on the diagonal
+se.prediction <- sqrt(diag(vcov.prediction))
+
+# Get the predicted value by multiplying the design matrix
+#   against our coefficient estimates
+predicted <- (test.X %*% coef(fixed.attainment))
+
+# Calculate the t-statistic corresponding to a 95% confidence level and
+#   the appropriate num. of degrees of freedom
+t.stat <- qt(1 - (1 - 0.95)/2, fixed.attainment$df.residual)
+
+# Calculate the lower and upper bounds of the confidence interval
+lower.bound <- as.numeric(predicted - t.stat * se.prediction)
+upper.bound <- as.numeric(predicted + t.stat * se.prediction)
+
+head(cbind(lower.bound, predicted, upper.bound))
+
+library(scales)
+
+grams_marginal_enrollment <- data.frame(gdpPercap = gdpPercap.sweep,
+  prediction = predicted,
+  lower = lower.bound,
+  upper = upper.bound)
+
+ggplot(grams_marginal_enrollment, mapping = aes(x = exp(1)^gdpPercap, y = prediction)) +
+  geom_line() +
+  geom_ribbon(mapping = aes(ymin = lower, ymax = upper), alpha = 0.4) +
+  scale_x_continuous() +
+  labs(x = 'Increase in Consumption (Grams)', y = 'Predicted Increase in Grade Attainment (Grade)') +
+  theme_minimal() +
+  ggtitle("Consumption on Grade Attainment Marginal Effects Plot")
+```
+
+#### Completion
+
+```{r}
+gdpPercap.sweep <- log(seq(100, 5000, 1e2)) # A parameter sweep of per-capita GDP change
+
+# Get the columns in the same order
+new.X <- model.frame(fixed.completion)
+new.X <- new.X[,names(coef(fixed.completion))]
+
+# Get a short representation of design matrix
+test.X <- colMeans(new.X)
+test.X[1:length(test.X)] <- 0 # Mean value for subject-centered data is always zero)
+
+# Fill out an empty test matrix
+test.X <- matrix(rep(test.X, each = length(gdpPercap.sweep)), nrow = length(gdpPercap.sweep))
+
+# Insert the parameter sweep
+test.X[,which(colnames(new.X) == 'log_grams')] <- gdpPercap.sweep
+
+level <- 0.95 # For a 95% confidence interval
+
+# Get the covariance matrix of the predictions
+vcov.prediction <- test.X %*% vcov(fixed.completion) %*% t(test.X)
+
+# The standard error of the prediction is then on the diagonal
+se.prediction <- sqrt(diag(vcov.prediction))
+
+# Get the predicted value by multiplying the design matrix
+#   against our coefficient estimates
+predicted <- (test.X %*% coef(fixed.completion))
+
+# Calculate the t-statistic corresponding to a 95% confidence level and
+#   the appropriate num. of degrees of freedom
+t.stat <- qt(1 - (1 - 0.95)/2, fixed.completion$df.residual)
+
+# Calculate the lower and upper bounds of the confidence interval
+lower.bound <- as.numeric(predicted - t.stat * se.prediction)
+upper.bound <- as.numeric(predicted + t.stat * se.prediction)
+
+head(cbind(lower.bound, predicted, upper.bound))
+
+library(scales)
+
+grams_marginal_enrollment <- data.frame(gdpPercap = gdpPercap.sweep,
+  prediction = predicted,
+  lower = lower.bound,
+  upper = upper.bound)
+
+ggplot(grams_marginal_enrollment, mapping = aes(x = exp(1)^gdpPercap, y = prediction)) +
+  geom_line() +
+  geom_ribbon(mapping = aes(ymin = lower, ymax = upper), alpha = 0.4) +
+  scale_x_continuous() +
+  labs(x = 'Increase in Consumption (Grams)', y = 'Predicted Increase in School Completion (Years)') +
+  theme_minimal() +
+  ggtitle("Consumption on School Completion Marginal Effects Plot")
+```
+
+#### Enrollment on kcal
+
+```{r}
+gdpPercap.sweep <- log(seq(100, 5000, 1e2)) # A parameter sweep of per-capita GDP change
+
+# Get the columns in the same order
+new.X <- model.frame(fixed.enrollment.kcal)
+new.X <- new.X[,names(coef(fixed.enrollment.kcal))]
+
+# Get a short representation of design matrix
+test.X <- colMeans(new.X)
+test.X[1:length(test.X)] <- 0 # Mean value for subject-centered data is always zero)
+
+# Fill out an empty test matrix
+test.X <- matrix(rep(test.X, each = length(gdpPercap.sweep)), nrow = length(gdpPercap.sweep))
+
+# Insert the parameter sweep
+test.X[,which(colnames(new.X) == 'log_kcal')] <- gdpPercap.sweep
+
+level <- 0.95 # For a 95% confidence interval
+
+# Get the covariance matrix of the predictions
+vcov.prediction <- test.X %*% vcov(fixed.enrollment.kcal) %*% t(test.X)
+
+# The standard error of the prediction is then on the diagonal
+se.prediction <- sqrt(diag(vcov.prediction))
+
+# Get the predicted value by multiplying the design matrix
+#   against our coefficient estimates
+predicted <- (test.X %*% coef(fixed.enrollment.kcal))
+
+# Calculate the t-statistic corresponding to a 95% confidence level and
+#   the appropriate num. of degrees of freedom
+t.stat <- qt(1 - (1 - 0.95)/2, fixed.enrollment.kcal$df.residual)
+
+# Calculate the lower and upper bounds of the confidence interval
+lower.bound <- as.numeric(predicted - t.stat * se.prediction)
+upper.bound <- as.numeric(predicted + t.stat * se.prediction)
+
+head(cbind(lower.bound, predicted, upper.bound))
+
+library(scales)
+
+grams_marginal_enrollment <- data.frame(gdpPercap = gdpPercap.sweep,
+  prediction = predicted,
+  lower = lower.bound,
+  upper = upper.bound)
+
+ggplot(grams_marginal_enrollment, mapping = aes(x = exp(1)^gdpPercap, y = prediction)) +
+  geom_line() +
+  geom_ribbon(mapping = aes(ymin = lower, ymax = upper), alpha = 0.4) +
+  scale_x_continuous() +
+  labs(x = 'Increase in Energy Content (kcal)', y = 'Predicted Increase in Probability of Enrollment') +
+  theme_minimal() +
+  ggtitle("Energy Content on Enrollment Marginal Effects Plot")
+```
+
+#### Attainment on kcal
+
+```{r}
+gdpPercap.sweep <- log(seq(100, 5000, 1e2)) # A parameter sweep of per-capita GDP change
+
+# Get the columns in the same order
+new.X <- model.frame(fixed.attainment.kcal)
+new.X <- new.X[,names(coef(fixed.attainment.kcal))]
+
+# Get a short representation of design matrix
+test.X <- colMeans(new.X)
+test.X[1:length(test.X)] <- 0 # Mean value for subject-centered data is always zero)
+
+# Fill out an empty test matrix
+test.X <- matrix(rep(test.X, each = length(gdpPercap.sweep)), nrow = length(gdpPercap.sweep))
+
+# Insert the parameter sweep
+test.X[,which(colnames(new.X) == 'log_kcal')] <- gdpPercap.sweep
+
+level <- 0.95 # For a 95% confidence interval
+
+# Get the covariance matrix of the predictions
+vcov.prediction <- test.X %*% vcov(fixed.attainment.kcal) %*% t(test.X)
+
+# The standard error of the prediction is then on the diagonal
+se.prediction <- sqrt(diag(vcov.prediction))
+
+# Get the predicted value by multiplying the design matrix
+#   against our coefficient estimates
+predicted <- (test.X %*% coef(fixed.attainment.kcal))
+
+# Calculate the t-statistic corresponding to a 95% confidence level and
+#   the appropriate num. of degrees of freedom
+t.stat <- qt(1 - (1 - 0.95)/2, fixed.attainment.kcal$df.residual)
+
+# Calculate the lower and upper bounds of the confidence interval
+lower.bound <- as.numeric(predicted - t.stat * se.prediction)
+upper.bound <- as.numeric(predicted + t.stat * se.prediction)
+
+head(cbind(lower.bound, predicted, upper.bound))
+
+library(scales)
+
+grams_marginal_enrollment <- data.frame(gdpPercap = gdpPercap.sweep,
+  prediction = predicted,
+  lower = lower.bound,
+  upper = upper.bound)
+
+ggplot(grams_marginal_enrollment, mapping = aes(x = exp(1)^gdpPercap, y = prediction)) +
+  geom_line() +
+  geom_ribbon(mapping = aes(ymin = lower, ymax = upper), alpha = 0.4) +
+  scale_x_continuous() +
+  labs(x = 'Increase in Energy Content (kcal)', y = 'Predicted Increase in Grade Attainment (Grade)') +
+  theme_minimal() +
+  ggtitle("Energy Content on Grade Attainment Marginal Effects Plot")
+```
+
+#### Completion on kcal
+
+```{r}
+gdpPercap.sweep <- log(seq(100, 5000, 1e2)) # A parameter sweep of per-capita GDP change
+
+# Get the columns in the same order
+new.X <- model.frame(fixed.completion.kcal)
+new.X <- new.X[,names(coef(fixed.completion.kcal))]
+
+# Get a short representation of design matrix
+test.X <- colMeans(new.X)
+test.X[1:length(test.X)] <- 0 # Mean value for subject-centered data is always zero)
+
+# Fill out an empty test matrix
+test.X <- matrix(rep(test.X, each = length(gdpPercap.sweep)), nrow = length(gdpPercap.sweep))
+
+# Insert the parameter sweep
+test.X[,which(colnames(new.X) == 'log_kcal')] <- gdpPercap.sweep
+
+level <- 0.95 # For a 95% confidence interval
+
+# Get the covariance matrix of the predictions
+vcov.prediction <- test.X %*% vcov(fixed.completion.kcal) %*% t(test.X)
+
+# The standard error of the prediction is then on the diagonal
+se.prediction <- sqrt(diag(vcov.prediction))
+
+# Get the predicted value by multiplying the design matrix
+#   against our coefficient estimates
+predicted <- (test.X %*% coef(fixed.completion.kcal))
+
+# Calculate the t-statistic corresponding to a 95% confidence level and
+#   the appropriate num. of degrees of freedom
+t.stat <- qt(1 - (1 - 0.95)/2, fixed.completion.kcal$df.residual)
+
+# Calculate the lower and upper bounds of the confidence interval
+lower.bound <- as.numeric(predicted - t.stat * se.prediction)
+upper.bound <- as.numeric(predicted + t.stat * se.prediction)
+
+head(cbind(lower.bound, predicted, upper.bound))
+
+library(scales)
+
+grams_marginal_enrollment <- data.frame(gdpPercap = gdpPercap.sweep,
+  prediction = predicted,
+  lower = lower.bound,
+  upper = upper.bound)
+
+ggplot(grams_marginal_enrollment, mapping = aes(x = exp(1)^gdpPercap, y = prediction)) +
+  geom_line() +
+  geom_ribbon(mapping = aes(ymin = lower, ymax = upper), alpha = 0.4) +
+  scale_x_continuous() +
+  labs(x = 'Increase in Energy Content (kcal)', y = 'Predicted Increase in School Completion (Years)') +
+  theme_minimal() +
+  ggtitle("Energy Content on School Completion Marginal Effects Plot")
+```
+
+### Model Specification
+
+$$
+y_{it} = \beta_0 + \beta_1logkcal + \beta_2age + \beta_3logincome + \alpha_2ID + \delta_2WAVE + \gamma_2PROVINCE + \epsilon_{it}
+$$
+
